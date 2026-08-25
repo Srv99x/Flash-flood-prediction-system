@@ -13,7 +13,7 @@
 
 ## 2. Pilot district
 
-**Kamrup, Assam** (Guwahati region)
+**Kamrup Metropolitan, Assam** (Guwahati region)
 
 ## 3. Layers found
 
