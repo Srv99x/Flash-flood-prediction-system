@@ -10,3 +10,5 @@ folium
 matplotlib
 jupyter
 requests
+rasterstats
+pysheds

@@ -8,7 +8,8 @@ def compute_slope(dem_array, cellsize):
     Parameters
     ----------
     dem_array : numpy.ndarray
-        Elevation values in metres.
+        Elevation values in metres. NoData values should be represented
+        as np.nan.
     cellsize : float or tuple
         Cell size in metres. If a single value is provided,
         it is used for both X and Y directions.
@@ -24,8 +25,10 @@ def compute_slope(dem_array, cellsize):
     else:
         cellsize_y = cellsize_x = cellsize
 
+    dem = dem_array.astype(float)
+
     gradient_y, gradient_x = np.gradient(
-        dem_array.astype(float),
+        dem,
         cellsize_y,
         cellsize_x
     )
