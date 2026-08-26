@@ -1,37 +1,17 @@
 """
-weather_fetch.py — Open-Meteo ERA5-Land archive fetcher for Kamrup Metropolitan.
+Open-Meteo ERA5-Land weather fetcher.
 
-Public API, keyless.  Endpoint: https://archive-api.open-meteo.com/v1/archive
-ERA5-Land resolution: 0.1° (~11 km); temporal: hourly from 1950-01-01.
+IMPORTANT RESOLUTION NOTE:
+Open-Meteo's ERA5-Land archive is natively ~9km resolution. Our analysis grid is
+1km. Fetching weather per 1km grid cell would issue ~80x more API calls than
+necessary and would misrepresent 9km data as 1km-resolution weather.
 
-Usage example
--------------
-    from app.weather_fetch import fetch_weather_for_grid
-
-    grid_gdf = gpd.read_parquet("data/processed/grid.parquet")
-    df = fetch_weather_for_grid(
-        grid_gdf,
-        start_date="2024-06-01",
-        end_date="2024-06-30",
-        cache_dir="data/processed/weather",
-    )
-    # df columns: grid_id, time, precip_mm, soil_moisture_0_7cm
-    # (plus the API raw columns renamed for consistency)
-
-Notes
------
-* ERA5-Land is ~0.1° grid so many 1 km cells share the same ERA5 pixel.
-  We deduplicate by (rounded_lat, rounded_lon) before hitting the API and
-  then broadcast back to the full grid — avoids redundant calls on the
-  ~870-cell district.
-* The API allows one coordinate per call.  We loop over unique ERA5 pixels
-  with a small sleep to stay comfortably under the 10,000 call/day free limit.
-* If a cached parquet exists for a (lat, lon, start_date, end_date) key it is
-  reused without a network call (idempotent re-runs).
-* API variables fetched:
-    precipitation          → precip_mm       (mm h⁻¹)
-    soil_moisture_0_to_7cm → soil_moisture_0_7cm (m³/m³)
-  Both are available in ERA5-Land hourly.
+Instead: a coarse set of weather sample points (~9km spacing) is generated over
+the district's bounding box, fetched once each, and every 1km grid cell is
+assigned to its nearest weather point (see assign_grid_to_weather_points).
+Downstream users of this data must treat precipitation/soil-moisture/temperature
+as ~9km-resolution fields, nearest-neighbour-downscaled onto the 1km grid — not
+as genuine 1km-resolution weather.
 """
 
 from __future__ import annotations
@@ -40,41 +20,298 @@ import logging
 import time
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
+import geopandas as gpd
 import requests
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
 ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
+HOURLY_VARS = "precipitation,soil_moisture_0_to_7cm,soil_moisture_7_to_28cm,temperature_2m"
+TIMEZONE = "Asia/Kolkata"
 
-# ERA5-Land is 0.1° — round coordinates to nearest 0.1° to deduplicate calls.
-ERA5_RESOLUTION = 0.1  # degrees
 
-# API variable names  →  our column names
-VARIABLE_MAP: dict[str, str] = {
+def generate_weather_points(boundary_gdf, spacing_km=9, metric_crs="EPSG:32646"):
+    """
+    Generate a coarse grid of weather sample points spaced ~spacing_km apart,
+    covering the bounding box of boundary_gdf.
+
+    Parameters
+    ----------
+    boundary_gdf : geopandas.GeoDataFrame
+        District boundary (or any geometry) whose bounding box the points
+        should cover. Must have a CRS set.
+    spacing_km : float
+        Spacing between sample points, in kilometres.
+    metric_crs : str
+        Projected CRS used to compute spacing accurately. Default EPSG:32646
+        (UTM zone 46N).
+
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        Columns: weather_point_id, lat, lon, geometry (Point, EPSG:4326).
+    """
+    if boundary_gdf.crs is None:
+        raise ValueError("boundary_gdf must have a CRS set")
+
+    spacing_m = spacing_km * 1000
+    boundary_metric = boundary_gdf.to_crs(metric_crs)
+    minx, miny, maxx, maxy = boundary_metric.total_bounds
+
+    n_cols = int(np.ceil((maxx - minx) / spacing_m))
+    n_rows = int(np.ceil((maxy - miny) / spacing_m))
+    n_cols = max(n_cols, 1)
+    n_rows = max(n_rows, 1)
+
+    point_ids = []
+    xs = []
+    ys = []
+    for row in range(n_rows):
+        y = miny + (row + 0.5) * spacing_m
+        for col in range(n_cols):
+            x = minx + (col + 0.5) * spacing_m
+            point_ids.append(f"WP_R{row:02d}_C{col:02d}")
+            xs.append(x)
+            ys.append(y)
+
+    points_metric = gpd.GeoDataFrame(
+        {"weather_point_id": point_ids},
+        geometry=gpd.points_from_xy(xs, ys),
+        crs=metric_crs,
+    )
+    points_4326 = points_metric.to_crs("EPSG:4326")
+    points_4326["lat"] = points_4326.geometry.y
+    points_4326["lon"] = points_4326.geometry.x
+
+    return points_4326[["weather_point_id", "lat", "lon", "geometry"]]
+
+
+def fetch_weather_point(
+    weather_point_id,
+    lat,
+    lon,
+    start_date,
+    end_date,
+    cache_dir,
+    max_retries=5,
+    backoff_base=2.0,
+    timeout_s=60,
+    request_delay_s=1.5,
+):
+    """
+    Fetch hourly precipitation, soil moisture, and temperature for one point
+    over [start_date, end_date] from the Open-Meteo archive API.
+
+    Uses a local parquet cache keyed by weather_point_id: if cached data
+    already exists, the API is not called again.
+
+    Returns
+    -------
+    (pandas.DataFrame, bool)
+        Tidy dataframe with columns weather_point_id, lat, lon, timestamp,
+        precipitation_mm, soil_moisture_0_7, soil_moisture_7_28, temp_c,
+        and a bool indicating whether an API call was actually made
+        (False = served from cache).
+    """
+    cache_dir = Path(cache_dir)
+    cache_path = cache_dir / f"{weather_point_id}.parquet"
+
+    if cache_path.exists():
+        return pd.read_parquet(cache_path), False
+
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "start_date": start_date,
+        "end_date": end_date,
+        "hourly": HOURLY_VARS,
+        "timezone": TIMEZONE,
+    }
+
+    last_exc = None
+    data = None
+    for attempt in range(max_retries):
+        try:
+            resp = requests.get(ARCHIVE_URL, params=params, timeout=timeout_s)
+            resp.raise_for_status()
+            data = resp.json()
+            break
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt < max_retries - 1:
+                time.sleep(backoff_base ** attempt)
+
+    if data is None:
+        raise RuntimeError(
+            f"Failed to fetch weather point {weather_point_id} after {max_retries} attempts"
+        ) from last_exc
+
+    hourly = data["hourly"]
+    df = pd.DataFrame(
+        {
+            "weather_point_id": weather_point_id,
+            "lat": lat,
+            "lon": lon,
+            "timestamp": pd.to_datetime(hourly["time"]),
+            "precipitation_mm": hourly["precipitation"],
+            "soil_moisture_0_7": hourly["soil_moisture_0_to_7cm"],
+            "soil_moisture_7_28": hourly["soil_moisture_7_to_28cm"],
+            "temp_c": hourly["temperature_2m"],
+        }
+    )
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(cache_path)
+
+    time.sleep(request_delay_s)
+
+    return df, True
+
+
+def fetch_all_weather_points(points_gdf, start_date, end_date, cache_dir):
+    """
+    Fetch (or load from cache) hourly weather for every point in points_gdf.
+
+    Returns
+    -------
+    (pandas.DataFrame, dict)
+        Concatenated tidy long-format weather table, and a stats dict with
+        n_points, n_api_calls, n_cache_hits, total_rows, wall_time_seconds.
+    """
+    start_time = time.time()
+    frames = []
+    n_api_calls = 0
+    n_cache_hits = 0
+
+    for row in points_gdf.itertuples():
+        df, called_api = fetch_weather_point(
+            row.weather_point_id, row.lat, row.lon, start_date, end_date, cache_dir
+        )
+        frames.append(df)
+        if called_api:
+            n_api_calls += 1
+        else:
+            n_cache_hits += 1
+
+    weather_df = pd.concat(frames, ignore_index=True)
+
+    stats = {
+        "n_points": len(points_gdf),
+        "n_api_calls": n_api_calls,
+        "n_cache_hits": n_cache_hits,
+        "total_rows": len(weather_df),
+        "wall_time_seconds": time.time() - start_time,
+    }
+
+    return weather_df, stats
+
+
+def add_antecedent_precip(df, windows_days=(3, 7)):
+    """
+    Add Antecedent Precipitation Index (API) columns to the weather-point table.
+
+    Computed per weather_point_id, on the ~9km weather-point table BEFORE the
+    grid join — each weather point has ~40+ grid cells assigned to it (see
+    assign_grid_to_weather_points), so computing the rolling sum after joining
+    onto grid_id would recompute identical values that many times over.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Output of fetch_all_weather_points. Must have columns
+        [weather_point_id, timestamp, precipitation_mm].
+    windows_days : tuple of int
+        Rolling windows in days. Default: (3, 7) -> api_3d, api_7d.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Input DataFrame with additional columns ``api_{n}d`` for each window,
+        in mm cumulative precipitation over the prior N days per weather point.
+        The first N*24 hours of each point's series will reflect a
+        shorter-than-N-day window (min_periods=1), not NaN.
+    """
+    df = df.sort_values(["weather_point_id", "timestamp"]).copy()
+
+    for days in windows_days:
+        window_h = days * 24
+        col_name = f"api_{days}d"
+        df[col_name] = (
+            df.groupby("weather_point_id")["precipitation_mm"]
+            .transform(lambda s: s.rolling(window=window_h, min_periods=1).sum())
+        )
+
+    return df
+
+
+def assign_grid_to_weather_points(grid_gdf, points_gdf, metric_crs="EPSG:32646"):
+    """
+    Assign each 1km grid cell to its nearest weather sample point.
+
+    Parameters
+    ----------
+    grid_gdf : geopandas.GeoDataFrame
+        Must have grid_id, centroid_lat, centroid_lon columns.
+    points_gdf : geopandas.GeoDataFrame
+        Output of generate_weather_points (weather_point_id, lat, lon, geometry).
+    metric_crs : str
+        Projected CRS used for accurate nearest-neighbour distance.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Columns: grid_id, weather_point_id, distance_m.
+    """
+    grid_points = gpd.GeoDataFrame(
+        {"grid_id": grid_gdf["grid_id"].values},
+        geometry=gpd.points_from_xy(grid_gdf["centroid_lon"], grid_gdf["centroid_lat"]),
+        crs="EPSG:4326",
+    ).to_crs(metric_crs)
+
+    points_metric = points_gdf.to_crs(metric_crs)
+
+    joined = gpd.sjoin_nearest(
+        grid_points, points_metric[["weather_point_id", "geometry"]], distance_col="distance_m"
+    )
+
+    return joined[["grid_id", "weather_point_id", "distance_m"]].reset_index(drop=True)
+
+
+# =============================================================================
+# DEPRECATED — superseded 2026-08-26 by the weather-point design above.
+#
+# This was the original per-grid-cell fetcher (dedup by rounding each grid
+# cell's centroid to the nearest 0.1 degree ERA5-Land pixel, then fanning the
+# fetched series back out to every grid_id that shares a pixel). It is kept
+# here, unused, because the team may need to explain to judges why the design
+# changed: ERA5-Land is natively ~9-11km resolution, and fanning identical
+# weather values out across all ~904 1km grid cells overstates how much
+# independent information the weather source actually provides at 1km.
+# Do not import or call these — use fetch_all_weather_points() above instead.
+# =============================================================================
+
+# ERA5-Land is 0.1 degree - round coordinates to nearest 0.1 degree grid point.
+ERA5_RESOLUTION_DEPRECATED = 0.1  # degrees
+
+# API variable names -> our column names
+VARIABLE_MAP_DEPRECATED: dict[str, str] = {
     "precipitation": "precip_mm",
     "soil_moisture_0_to_7cm": "soil_moisture_0_7cm",
 }
 
-REQUEST_SLEEP_S = 0.5   # seconds between API calls (conservative)
-REQUEST_TIMEOUT = 30    # seconds
+REQUEST_SLEEP_S_DEPRECATED = 0.5   # seconds between API calls (conservative)
+REQUEST_TIMEOUT_DEPRECATED = 30    # seconds
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-def _round_to_era5(val: float) -> float:
-    """Round a coordinate to the nearest ERA5-Land 0.1° grid point."""
-    return round(round(val / ERA5_RESOLUTION) * ERA5_RESOLUTION, 6)
+def _round_to_era5_deprecated(val: float) -> float:
+    """Round a coordinate to the nearest ERA5-Land 0.1 degree grid point."""
+    return round(round(val / ERA5_RESOLUTION_DEPRECATED) * ERA5_RESOLUTION_DEPRECATED, 6)
 
 
-def _cache_path(cache_dir: Path, lat: float, lon: float,
-                start_date: str, end_date: str) -> Path:
+def _cache_path_deprecated(cache_dir: Path, lat: float, lon: float,
+                            start_date: str, end_date: str) -> Path:
     """Deterministic parquet filename for a single ERA5 pixel + date range."""
     lat_s = f"{lat:.1f}".replace("-", "S").replace(".", "p")
     lon_s = f"{lon:.1f}".replace("-", "W").replace(".", "p")
@@ -82,8 +319,8 @@ def _cache_path(cache_dir: Path, lat: float, lon: float,
     return cache_dir / fname
 
 
-def _fetch_single_pixel(lat: float, lon: float,
-                         start_date: str, end_date: str) -> pd.DataFrame:
+def _fetch_single_pixel_deprecated(lat: float, lon: float,
+                                    start_date: str, end_date: str) -> pd.DataFrame:
     """
     Fetch hourly ERA5-Land precipitation + soil moisture for one pixel.
 
@@ -95,10 +332,10 @@ def _fetch_single_pixel(lat: float, lon: float,
         "longitude": lon,
         "start_date": start_date,
         "end_date": end_date,
-        "hourly": ",".join(VARIABLE_MAP.keys()),
-        "timezone": "Asia/Kolkata",   # IST — consistent with ASDMA records
+        "hourly": ",".join(VARIABLE_MAP_DEPRECATED.keys()),
+        "timezone": "Asia/Kolkata",   # IST - consistent with ASDMA records
     }
-    resp = requests.get(ARCHIVE_URL, params=params, timeout=REQUEST_TIMEOUT)
+    resp = requests.get(ARCHIVE_URL, params=params, timeout=REQUEST_TIMEOUT_DEPRECATED)
     resp.raise_for_status()
     payload = resp.json()
 
@@ -107,24 +344,22 @@ def _fetch_single_pixel(lat: float, lon: float,
         raise ValueError(f"Unexpected API response for ({lat}, {lon}): {list(hourly.keys())}")
 
     df = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
-    for api_var, col_name in VARIABLE_MAP.items():
-        df[col_name] = hourly.get(api_var)  # None → NaN if missing variable
+    for api_var, col_name in VARIABLE_MAP_DEPRECATED.items():
+        df[col_name] = hourly.get(api_var)  # None -> NaN if missing variable
 
     return df
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-def fetch_weather_for_grid(
+def fetch_weather_for_grid_deprecated(
     grid_gdf,
     start_date: str,
     end_date: str,
     cache_dir: str | Path = "data/processed/weather",
-    sleep_s: float = REQUEST_SLEEP_S,
+    sleep_s: float = REQUEST_SLEEP_S_DEPRECATED,
 ) -> pd.DataFrame:
     """
+    DEPRECATED — see module note above. Use fetch_all_weather_points() instead.
+
     Fetch Open-Meteo ERA5-Land weather for every cell in *grid_gdf*.
 
     Parameters
@@ -135,7 +370,7 @@ def fetch_weather_for_grid(
     start_date, end_date : str
         ISO-8601 dates, e.g. ``"2023-06-01"``.
     cache_dir : str or Path
-        Directory where per-pixel parquet files are cached.  Created if absent.
+        Directory where per-pixel parquet files are cached. Created if absent.
     sleep_s : float
         Seconds to wait between API calls (default 0.5 s).
 
@@ -145,13 +380,11 @@ def fetch_weather_for_grid(
         Long-format table with columns:
         ``grid_id, time, era5_lat, era5_lon, precip_mm, soil_moisture_0_7cm``
 
-        *precip_mm* is hourly precipitation in mm.
-        *soil_moisture_0_7cm* is volumetric soil moisture in m³/m³.
-
     Notes
     -----
-    * ERA5 resolution is 0.1° so multiple grid cells may share one ERA5 pixel.
-      The function deduplicates, fetches once, then fans out to all matching cells.
+    * ERA5 resolution is 0.1 degree so multiple grid cells may share one ERA5
+      pixel. The function deduplicates, fetches once, then fans out to all
+      matching cells.
     * Re-running is safe: cached pixels are not re-fetched.
     """
     cache_dir = Path(cache_dir)
@@ -162,11 +395,11 @@ def fetch_weather_for_grid(
         raise ValueError(f"grid_gdf must have columns {required_cols}; got {list(grid_gdf.columns)}")
 
     # ------------------------------------------------------------------
-    # 1. Build mapping: ERA5 pixel (rounded lat/lon) → list of grid_ids
+    # 1. Build mapping: ERA5 pixel (rounded lat/lon) -> list of grid_ids
     # ------------------------------------------------------------------
     grid_df = grid_gdf[["grid_id", "centroid_lat", "centroid_lon"]].copy()
-    grid_df["era5_lat"] = grid_df["centroid_lat"].apply(_round_to_era5)
-    grid_df["era5_lon"] = grid_df["centroid_lon"].apply(_round_to_era5)
+    grid_df["era5_lat"] = grid_df["centroid_lat"].apply(_round_to_era5_deprecated)
+    grid_df["era5_lon"] = grid_df["centroid_lon"].apply(_round_to_era5_deprecated)
 
     pixel_to_cells: dict[tuple[float, float], list[str]] = {}
     for _, row in grid_df.iterrows():
@@ -175,7 +408,7 @@ def fetch_weather_for_grid(
 
     n_unique = len(pixel_to_cells)
     logger.info(
-        "Grid has %d cells → %d unique ERA5-Land pixels to fetch "
+        "Grid has %d cells -> %d unique ERA5-Land pixels to fetch "
         "(date range: %s to %s)",
         len(grid_df), n_unique, start_date, end_date,
     )
@@ -186,19 +419,19 @@ def fetch_weather_for_grid(
     pixel_frames: list[pd.DataFrame] = []
 
     for i, ((era5_lat, era5_lon), cell_ids) in enumerate(pixel_to_cells.items(), start=1):
-        cache_file = _cache_path(cache_dir, era5_lat, era5_lon, start_date, end_date)
+        cache_file = _cache_path_deprecated(cache_dir, era5_lat, era5_lon, start_date, end_date)
 
         if cache_file.exists():
             logger.debug("[%d/%d] Cache hit: %s", i, n_unique, cache_file.name)
             pixel_df = pd.read_parquet(cache_file)
         else:
-            logger.info("[%d/%d] Fetching ERA5 pixel (%.1f, %.1f) …",
+            logger.info("[%d/%d] Fetching ERA5 pixel (%.1f, %.1f) ...",
                         i, n_unique, era5_lat, era5_lon)
             try:
-                pixel_df = _fetch_single_pixel(era5_lat, era5_lon, start_date, end_date)
+                pixel_df = _fetch_single_pixel_deprecated(era5_lat, era5_lon, start_date, end_date)
             except Exception as exc:
                 logger.error(
-                    "  Failed for (%.1f, %.1f): %s — skipping pixel.",
+                    "  Failed for (%.1f, %.1f): %s - skipping pixel.",
                     era5_lat, era5_lon, exc,
                 )
                 continue
@@ -223,48 +456,42 @@ def fetch_weather_for_grid(
 
     result = pd.concat(pixel_frames, ignore_index=True)
 
-    # Ensure consistent column order
     cols = ["grid_id", "time", "era5_lat", "era5_lon", "precip_mm", "soil_moisture_0_7cm"]
     result = result[[c for c in cols if c in result.columns]]
 
     logger.info(
-        "fetch_weather_for_grid complete: %d rows, %d grid cells, date range %s–%s",
+        "fetch_weather_for_grid_deprecated complete: %d rows, %d grid cells, date range %s-%s",
         len(result), result["grid_id"].nunique(), start_date, end_date,
     )
     return result
 
 
-def add_antecedent_precip(df: pd.DataFrame,
-                           windows_days: tuple[int, ...] = (3, 7)) -> pd.DataFrame:
+def add_antecedent_precip_per_cell_deprecated(df: pd.DataFrame,
+                                               windows_days: tuple[int, ...] = (3, 7)) -> pd.DataFrame:
     """
+    DEPRECATED — see module note above. Use add_antecedent_precip() instead,
+    which computes the same rolling sums once per weather_point_id instead of
+    once per grid_id (avoiding ~40x redundant computation on identical data).
+
     Add Antecedent Precipitation Index (API) columns to a weather DataFrame.
 
     API is the rolling cumulative precipitation over the prior N days,
-    per grid cell.  This is the highest-value feature in the model (CLAUDE.md §4).
+    per grid cell. This is the highest-value feature in the model (CLAUDE.md §4).
 
     Parameters
     ----------
     df : pandas.DataFrame
-        Output of fetch_weather_for_grid.  Must have columns
-        [grid_id, time, precip_mm].  *time* must be hourly and monotonically
+        Output of fetch_weather_for_grid_deprecated. Must have columns
+        [grid_id, time, precip_mm]. *time* must be hourly and monotonically
         increasing within each grid_id.
     windows_days : tuple of int
-        Rolling windows in days.  Default: (3, 7) → api_3d, api_7d.
+        Rolling windows in days. Default: (3, 7) -> api_3d, api_7d.
 
     Returns
     -------
     pandas.DataFrame
         Input DataFrame with additional columns ``api_{n}d`` for each window,
         in mm cumulative precipitation over the prior N days.
-        The first N*24 hours of each cell will have NaN (insufficient history).
-
-    Notes
-    -----
-    * Rolling is computed in hours (window * 24) with min_periods=1 to avoid
-      all-NaN at the start of the series.  For a true API you want at least
-      N days of prior data before your event window — ensure start_date is
-      set N days earlier than needed.
-    * Sort by grid_id + time is enforced defensively.
     """
     df = df.sort_values(["grid_id", "time"]).copy()
 
