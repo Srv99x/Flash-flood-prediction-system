@@ -1,11 +1,15 @@
 pandas
 numpy
 geopandas
+shapely
 rasterio
 scikit-learn
 xgboost
 shap
 streamlit
 folium
+streamlit-folium   # embeds Folium maps inside Streamlit (Step 3)
+paho-mqtt          # MQTT publish/subscribe structure — broker mocked in demo (Step 5)
+pyarrow            # parquet I/O for the grid file
 matplotlib
 jupyter

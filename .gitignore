@@ -1,6 +1,8 @@
 venv/
 data/raw/
 data/processed/
+# Allow the synthetic demo grid (generated, not raw field data)
+!data/processed/kamrup_metro_grid_1km.parquet
 __pycache__/
 .ipynb_checkpoints/
 *.tif
