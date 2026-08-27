@@ -23,8 +23,7 @@ Do NOT import or modify:
 
 import time
 import os
-import math
-import random
+import sys
 
 import numpy as np
 import pandas as pd
@@ -33,7 +32,9 @@ import folium
 import streamlit as st
 from streamlit_folium import st_folium
 
-from mqtt_sim import get_sensor_readings, SENSOR_NODES  # noqa: E402
+# mqtt_sim lives in the same app/ directory
+sys.path.insert(0, os.path.dirname(__file__))
+from mqtt_sim import get_sensor_readings  # noqa: E402
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PAGE CONFIG
@@ -48,53 +49,39 @@ st.set_page_config(
 # ══════════════════════════════════════════════════════════════════════════════
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
-GUWAHATI_LAT  = 26.14
-GUWAHATI_LON  = 91.74
-DEFAULT_ZOOM  = 11
-GRID_PARQUET  = os.path.join(
+GUWAHATI_LAT = 26.05
+GUWAHATI_LON = 91.70
+DEFAULT_ZOOM = 11
+GRID_PARQUET = os.path.join(
     os.path.dirname(__file__), "..", "data", "processed",
     "kamrup_metro_grid_1km.parquet"
 )
 
-# Risk colour thresholds
 RISK_BINS   = [0.0,  0.25,  0.50,  0.75, 1.01]
-RISK_COLORS = ["#C8F7C5", "#FFF176", "#FF8C00", "#C62828"]  # pale-green, yellow, orange, red
+RISK_COLORS = ["#C8F7C5", "#FFF176", "#FF8C00", "#C62828"]
 RISK_LABELS = ["Low", "Medium", "High", "Severe"]
 
-# Hotspot centroids used by the dummy risk generator (hilly northern edge)
-# TEMPORARY — these are only needed by generate_dummy_risk()
+# Hotspot centroids — used only by generate_dummy_risk()
 _HOTSPOTS = [
-    (26.40, 91.52),  # Kamakhya Hills
-    (26.38, 91.70),  # Nilachal Hill area
-    (26.35, 91.85),  # North-east foothills
-    (26.42, 91.60),  # Far north ridge
+    (26.40, 91.52),
+    (26.38, 91.70),
+    (26.35, 91.85),
+    (26.42, 91.60),
 ]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# RISK GENERATION  — TEMPORARY SECTION
-# Replace generate_dummy_risk() with real model predictions when ready.
+# RISK GENERATION  — TEMPORARY, clearly isolated for easy swap
 # ══════════════════════════════════════════════════════════════════════════════
 
 def generate_dummy_risk(grid_gdf: gpd.GeoDataFrame) -> np.ndarray:
     """
-    Generate spatially coherent fake risk probabilities for each grid cell.
-
-    Strategy
-    --------
-    - Higher base risk near the northern / hilly edge (lat gradient).
-    - Distance-based falloff from predefined hotspot centroids.
-    - Small Gaussian noise for visual realism.
-    - Output is clipped to [0, 1].
+    Generate spatially coherent fake risk probabilities.
 
     # TEMPORARY — replaced by real model predictions in app/predict.py
-    # To swap: call predict.predict_risk(grid_gdf) and return its output array.
+    # To swap: return predict.predict_risk(grid_gdf) here.
 
-    Args:
-        grid_gdf: GeoDataFrame with columns centroid_lat, centroid_lon.
-
-    Returns:
-        np.ndarray of shape (n,) with float32 values in [0.0, 1.0].
+    Strategy: lat gradient (north = higher risk) + hotspot falloff + noise.
     """
     np.random.seed(7)
     lats = grid_gdf["centroid_lat"].values
@@ -102,46 +89,31 @@ def generate_dummy_risk(grid_gdf: gpd.GeoDataFrame) -> np.ndarray:
 
     lat_min, lat_max = lats.min(), lats.max()
     lat_range = lat_max - lat_min if lat_max > lat_min else 1e-6
+    lat_score = (lats - lat_min) / lat_range
 
-    # ── 1. Latitude gradient: north is hillier → higher risk ──────────────────
-    lat_score = (lats - lat_min) / lat_range  # 0 (south) → 1 (north)
-
-    # ── 2. Hotspot proximity: distance falloff (degrees) ──────────────────────
     hotspot_score = np.zeros(len(grid_gdf))
     for h_lat, h_lon in _HOTSPOTS:
         dist = np.sqrt((lats - h_lat) ** 2 + (lons - h_lon) ** 2)
-        sigma = 0.12  # ~13 km influence radius
+        sigma = 0.12
         hotspot_score += np.exp(-(dist ** 2) / (2 * sigma ** 2))
-    # Normalise so peak hotspot contribution ≤ 0.5
     hs_max = hotspot_score.max()
     if hs_max > 0:
         hotspot_score = 0.5 * hotspot_score / hs_max
 
-    # ── 3. Combine + noise ────────────────────────────────────────────────────
     combined = 0.35 * lat_score + 0.50 * hotspot_score
     noise    = np.random.normal(0, 0.04, size=len(grid_gdf))
-    risk     = np.clip(combined + noise, 0.0, 1.0).astype(np.float32)
-
-    return risk
+    return np.clip(combined + noise, 0.0, 1.0).astype(np.float32)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DATA LOADING  — cached so the grid loads ONCE, not on every widget move
+# DATA LOADING — cached so the grid + risk scores load ONCE per session
 # ══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_data
 def load_grid() -> gpd.GeoDataFrame:
-    """
-    Load the Kamrup Metro 1 km grid and attach dummy risk scores.
-
-    Cached with @st.cache_data — runs once per app session.
-    """
+    """Load the Kamrup Metro grid and attach dummy risk scores. Cached once."""
     gdf = gpd.read_parquet(GRID_PARQUET)
-
-    # Attach risk scores — TEMPORARY (see generate_dummy_risk)
     gdf["risk_probability"] = generate_dummy_risk(gdf)
-
-    # Derived columns
     gdf["risk_pct"]  = (gdf["risk_probability"] * 100).round(1)
     gdf["severity"]  = pd.cut(
         gdf["risk_probability"],
@@ -152,9 +124,8 @@ def load_grid() -> gpd.GeoDataFrame:
     return gdf
 
 
-@st.cache_data
 def get_risk_color(risk: float) -> str:
-    """Map a risk value to its hex colour."""
+    """Map a risk value [0,1] to its display hex colour."""
     for i, threshold in enumerate(RISK_BINS[1:]):
         if risk < threshold:
             return RISK_COLORS[i]
@@ -162,84 +133,100 @@ def get_risk_color(risk: float) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MAP BUILDER — cached per threshold to avoid full rebuild on slider move
+# MAP BUILDER
+# Not cached with @st.cache_data — folium.Map contains lambdas that
+# can't be pickled by Streamlit's cache. The heavy work (grid I/O + risk
+# scoring) is cached in load_grid(); map build is ~1 s from memory.
 # ══════════════════════════════════════════════════════════════════════════════
 
-@st.cache_data(show_spinner=False)
-def build_folium_map(_gdf: gpd.GeoDataFrame, threshold: float) -> folium.Map:
+def build_folium_map(gdf: gpd.GeoDataFrame, threshold: float) -> folium.Map:
     """
     Build the Folium choropleth map of all 904 grid cells.
 
-    Cached per (threshold) — the map only re-renders when the threshold
-    slider value changes, not on every widget interaction.
-
-    Args:
-        _gdf:      Grid GeoDataFrame (leading underscore tells Streamlit
-                   not to hash this argument — it's identified by threshold).
-        threshold: Current alert threshold from the sidebar slider.
-
-    Returns:
-        folium.Map ready for st_folium().
+    Uses a single GeoJson FeatureCollection — style properties are stored
+    inside each feature's properties dict so the style_function lambda
+    captures nothing from the outer scope (no closure = no pickle issue).
     """
     m = folium.Map(
         location=[GUWAHATI_LAT, GUWAHATI_LON],
         zoom_start=DEFAULT_ZOOM,
-        tiles="CartoDB positron",
+        tiles=None,
         control_scale=True,
     )
 
-    # Add tile layer with attribution
     folium.TileLayer(
         tiles="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
-        attr='&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; '
-             '<a href="https://carto.com/">CARTO</a>',
+        attr=(
+            '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a>'
+            ' &copy; <a href="https://carto.com/">CARTO</a>'
+        ),
         name="Dark Mode",
         max_zoom=19,
     ).add_to(m)
 
-    # Draw each grid cell polygon
-    for _, row in _gdf.iterrows():
-        risk  = row["risk_probability"]
-        color = get_risk_color(risk)
-        fill_opacity = 0.0 if risk < 0.25 else 0.45
-        border_color = "#FF4444" if risk >= threshold else "#888888"
-        border_weight = 2 if risk >= threshold else 0.4
+    # Build a FeatureCollection with style props embedded in each feature
+    features = []
+    for _, row in gdf.iterrows():
+        risk          = float(row["risk_probability"])
+        fill_color    = get_risk_color(risk)
+        fill_opacity  = 0.0 if risk < 0.25 else 0.50
+        border_color  = "#FF4444" if risk >= threshold else "#555555"
+        border_weight = 2.0 if risk >= threshold else 0.3
 
-        popup_html = (
-            f"<b>Grid ID:</b> {row['grid_id']}<br>"
-            f"<b>Risk:</b> {row['risk_pct']}%<br>"
-            f"<b>Severity:</b> {row['severity']}<br>"
-            f"<b>Lat/Lon:</b> {row['centroid_lat']:.4f}, {row['centroid_lon']:.4f}"
-        )
-
-        folium.GeoJson(
-            row["geometry"].__geo_interface__,
-            style_function=lambda feat, c=color, fo=fill_opacity, bc=border_color, bw=border_weight: {
-                "fillColor":   c,
-                "color":       bc,
-                "weight":      bw,
-                "fillOpacity": fo,
+        features.append({
+            "type": "Feature",
+            "geometry": row["geometry"].__geo_interface__,
+            "properties": {
+                "grid_id":      row["grid_id"],
+                "risk_pct":     float(row["risk_pct"]),
+                "severity":     str(row["severity"]),
+                "lat":          float(row["centroid_lat"]),
+                "lon":          float(row["centroid_lon"]),
+                # Pre-computed style — lambda below reads these, captures nothing
+                "fillColor":    fill_color,
+                "fillOpacity":  fill_opacity,
+                "color":        border_color,
+                "weight":       border_weight,
             },
-            tooltip=f"{row['grid_id']} | Risk: {row['risk_pct']}%",
-            popup=folium.Popup(popup_html, max_width=220),
-        ).add_to(m)
+        })
 
-    # Legend
-    legend_html = """
-    <div style="position:fixed; bottom:30px; left:30px; z-index:9999;
-                background:rgba(20,20,30,0.85); padding:12px 16px;
-                border-radius:8px; border:1px solid #444;
-                font-family:monospace; font-size:12px; color:#eee;">
-      <b>RISK LEVEL</b><br>
-      <span style="background:#C8F7C5;padding:0 6px;">&nbsp;</span> &lt; 25% — Low<br>
-      <span style="background:#FFF176;padding:0 6px;">&nbsp;</span> 25–50% — Medium<br>
-      <span style="background:#FF8C00;padding:0 6px;">&nbsp;</span> 50–75% — High<br>
-      <span style="background:#C62828;padding:0 6px;">&nbsp;</span> &gt; 75% — Severe<br>
-      <hr style="border-color:#555;margin:6px 0;">
-      <span style="color:#aaa;font-size:10px;">⚠ Risk scores are SIMULATED</span>
+    folium.GeoJson(
+        {"type": "FeatureCollection", "features": features},
+        style_function=lambda feat: {
+            "fillColor":   feat["properties"]["fillColor"],
+            "color":       feat["properties"]["color"],
+            "weight":      feat["properties"]["weight"],
+            "fillOpacity": feat["properties"]["fillOpacity"],
+        },
+        tooltip=folium.GeoJsonTooltip(
+            fields=["grid_id", "risk_pct", "severity"],
+            aliases=["Grid ID", "Risk %", "Severity"],
+            localize=True,
+            sticky=True,
+        ),
+        popup=folium.GeoJsonPopup(
+            fields=["grid_id", "risk_pct", "severity", "lat", "lon"],
+            aliases=["Grid ID", "Risk %", "Severity", "Lat", "Lon"],
+            max_width=240,
+        ),
+        name="Risk Grid",
+    ).add_to(m)
+
+    # Legend overlay
+    m.get_root().html.add_child(folium.Element("""
+    <div style="position:fixed;bottom:30px;left:30px;z-index:9999;
+                background:rgba(20,20,30,0.88);padding:12px 16px;
+                border-radius:8px;border:1px solid #334;
+                font-family:monospace;font-size:12px;color:#eee;">
+      <b style="color:#4fc3f7;">RISK LEVEL</b><br>
+      <span style="background:#C8F7C5;padding:2px 8px;">&nbsp;</span>&nbsp;&lt;25% &mdash; Low<br>
+      <span style="background:#FFF176;padding:2px 8px;">&nbsp;</span>&nbsp;25&ndash;50% &mdash; Medium<br>
+      <span style="background:#FF8C00;padding:2px 8px;">&nbsp;</span>&nbsp;50&ndash;75% &mdash; High<br>
+      <span style="background:#C62828;padding:2px 8px;">&nbsp;</span>&nbsp;&gt;75% &mdash; Severe<br>
+      <hr style="border-color:#445;margin:6px 0;">
+      <span style="color:#888;font-size:10px;">&#9888; Risk scores are SIMULATED</span>
     </div>
-    """
-    m.get_root().html.add_child(folium.Element(legend_html))
+    """))
 
     return m
 
@@ -250,7 +237,6 @@ def build_folium_map(_gdf: gpd.GeoDataFrame, threshold: float) -> folium.Map:
 
 st.markdown("""
 <style>
-/* ── Base theme ── */
 [data-testid="stAppViewContainer"] {
     background: linear-gradient(135deg, #0d1117 0%, #0f1a2e 60%, #0d1117 100%);
 }
@@ -258,8 +244,6 @@ st.markdown("""
     background: rgba(10, 20, 40, 0.95) !important;
     border-right: 1px solid #1e3a5f;
 }
-
-/* ── Metric boxes ── */
 [data-testid="stMetric"] {
     background: rgba(14, 40, 80, 0.6);
     border: 1px solid #1e4a80;
@@ -268,37 +252,9 @@ st.markdown("""
 }
 [data-testid="stMetricValue"] { color: #4fc3f7 !important; font-weight: 700; }
 [data-testid="stMetricLabel"] { color: #90caf9 !important; }
-
-/* ── Warning table ── */
-.warning-table th { background: #1a3a6b; color: #90caf9; }
-.warning-table tr:nth-child(even) { background: rgba(30, 60, 100, 0.4); }
-
-/* ── IoT panel ── */
-.iot-panel {
-    background: rgba(0, 40, 30, 0.6);
-    border: 1px solid #00695c;
-    border-radius: 10px;
-    padding: 14px;
-    margin-top: 8px;
-}
-.iot-banner {
-    color: #4db6ac;
-    font-size: 11px;
-    letter-spacing: 0.08em;
-    font-weight: 600;
-    text-transform: uppercase;
-}
-
-/* ── Section headers ── */
 h2 { color: #4fc3f7 !important; border-bottom: 1px solid #1e4a80; padding-bottom: 6px; }
 h3 { color: #81d4fa !important; }
-
-/* ── Sidebar labels ── */
-.sidebar-caption {
-    color: #607d8b;
-    font-size: 11px;
-    font-style: italic;
-}
+.sidebar-caption { color: #607d8b; font-size: 11px; font-style: italic; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -314,10 +270,7 @@ with st.sidebar:
     st.divider()
 
     st.markdown("### 📅 Forecast Date")
-    forecast_date = st.date_input(
-        "Select date",
-        label_visibility="collapsed",
-    )
+    forecast_date = st.date_input("Select date", label_visibility="collapsed")
     st.caption("Date selection is ready to wire into the model pipeline.")
 
     st.divider()
@@ -325,22 +278,16 @@ with st.sidebar:
     st.markdown("### ⚠️ Alert Threshold")
     threshold = st.slider(
         "Risk threshold for alerts",
-        min_value=0.0,
-        max_value=1.0,
-        value=0.60,
-        step=0.05,
-        format="%.2f",
+        min_value=0.0, max_value=1.0, value=0.60, step=0.05, format="%.2f",
         help="Cells with risk above this value appear in the warning table.",
     )
-    risk_pct_display = int(threshold * 100)
-    st.caption(f"Cells with risk ≥ **{risk_pct_display}%** trigger warnings.")
+    st.caption(f"Cells with risk ≥ **{int(threshold*100)}%** trigger warnings.")
 
     st.divider()
 
     st.markdown("### 📡 IoT Telemetry")
     iot_active = st.toggle(
-        "Ingest Live IoT Telemetry",
-        value=False,
+        "Ingest Live IoT Telemetry", value=False,
         help="Show live sensor readings from 5 simulated field stations.",
     )
     st.markdown(
@@ -368,12 +315,14 @@ with col_title:
 with col_date:
     st.markdown(f"<br><b>Forecast:</b> {forecast_date}", unsafe_allow_html=True)
 
+
 # ══════════════════════════════════════════════════════════════════════════════
 # LOAD DATA
 # ══════════════════════════════════════════════════════════════════════════════
 
 with st.spinner("Loading grid data …"):
     gdf = load_grid()
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN PANE — MAP
@@ -386,13 +335,14 @@ st_folium(
     flood_map,
     use_container_width=True,
     height=520,
-    returned_objects=[],  # no click return needed; reduces overhead
+    returned_objects=[],
 )
 
 st.caption(
-    "⚠️ **SIMULATED RISK DATA** — Synthetic risk scores are used for demonstration. "
+    "⚠️ **SIMULATED RISK DATA** — Synthetic risk scores used for demonstration.  "
     "Colour bands: 🟢 Low (<25%) · 🟡 Medium (25–50%) · 🟠 High (50–75%) · 🔴 Severe (>75%)"
 )
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN PANE — METRICS + WARNING TABLE
@@ -409,19 +359,16 @@ m1.metric("🛰️ Total Cells Monitored", f"{len(gdf):,}")
 m2.metric(
     "🚨 Cells Above Threshold",
     f"{len(above_thresh):,}",
-    delta=f"≥ {risk_pct_display}% risk",
+    delta=f"≥ {int(threshold*100)}% risk",
     delta_color="inverse",
 )
-m3.metric(
-    "🔺 Highest Risk",
-    f"{gdf['risk_probability'].max() * 100:.1f}%",
-)
+m3.metric("🔺 Highest Risk", f"{gdf['risk_probability'].max() * 100:.1f}%")
 
-st.markdown(f"**Showing top 10 highest-risk cells** (above {risk_pct_display}% threshold)")
+st.markdown(f"**Top 10 highest-risk cells** above {int(threshold*100)}% threshold")
 
 if top10.empty:
     st.info(
-        f"✅ No cells exceed the {risk_pct_display}% threshold. "
+        f"✅ No cells exceed the {int(threshold*100)}% threshold. "
         "Lower the slider to see warning candidates."
     )
 else:
@@ -430,7 +377,6 @@ else:
     display_df["Lat"] = display_df["Lat"].round(4)
     display_df["Lon"] = display_df["Lon"].round(4)
 
-    # Style by severity
     def _sev_color(val):
         return {
             "Low":    "color: #a5d6a7",
@@ -452,7 +398,7 @@ else:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# IOT TELEMETRY PANEL (conditional on sidebar toggle)
+# IOT TELEMETRY PANEL
 # ══════════════════════════════════════════════════════════════════════════════
 
 if iot_active:
@@ -467,47 +413,31 @@ if iot_active:
     st.caption(
         "5 virtual IoT sensors placed in hilly northern grid cells. "
         "Readings drift realistically every 3 seconds. "
-        "In production, this panel will consume a live MQTT feed via paho-mqtt."
+        "In production this panel consumes a live MQTT feed via paho-mqtt."
     )
 
     sensor_placeholder = st.empty()
-    refresh_count      = st.empty()
+    refresh_label      = st.empty()
 
-    MAX_REFRESHES = 600  # safety cap (~30 min at 3 s intervals)
-    for i in range(MAX_REFRESHES):
+    for i in range(600):   # safety cap ~30 min
         readings = get_sensor_readings()
-
-        rows = []
-        for r in readings:
-            # Risk level of this sensor's grid cell
-            cell_risk = gdf.loc[gdf["grid_id"] == r["grid_id"], "risk_probability"]
-            cell_risk_val = float(cell_risk.values[0]) if len(cell_risk) else 0.0
-
-            rows.append({
-                "Sensor":          f"{r['sensor_id']} — {r['label']}",
-                "Grid Cell":       r["grid_id"],
-                "Timestamp":       r["timestamp"],
-                "Rainfall mm/hr":  r["rainfall_mm_hr"],
-                "Soil Moisture %": r["soil_moisture_pct"],
-                "Water Level m":   r["water_level_m"],
-                "Cell Risk %":     round(cell_risk_val * 100, 1),
-            })
-
-        sensor_df = pd.DataFrame(rows)
 
         with sensor_placeholder.container():
             cols = st.columns(len(readings))
             for col, r in zip(cols, readings):
                 with col:
+                    cell_risk = gdf.loc[gdf["grid_id"] == r["grid_id"], "risk_probability"]
+                    crv = float(cell_risk.values[0]) if len(cell_risk) else 0.0
                     st.markdown(
-                        f"**{r['sensor_id']}**  \n"
-                        f"<small>{r['label']}</small>",
+                        f"**{r['sensor_id']}**  \n<small>{r['label']}</small>",
                         unsafe_allow_html=True,
                     )
-                    st.metric("🌧 Rainfall", f"{r['rainfall_mm_hr']} mm/hr")
+                    st.metric("🌧 Rainfall",     f"{r['rainfall_mm_hr']} mm/hr")
                     st.metric("🌱 Soil Moisture", f"{r['soil_moisture_pct']}%")
-                    st.metric("💧 Water Level", f"{r['water_level_m']} m")
+                    st.metric("💧 Water Level",   f"{r['water_level_m']} m")
                     st.caption(r["timestamp"])
 
-        refresh_count.caption(f"Last refresh: {time.strftime('%H:%M:%S')}  |  Refresh #{i+1}")
+        refresh_label.caption(
+            f"Last refresh: {time.strftime('%H:%M:%S')}  |  Update #{i+1}"
+        )
         time.sleep(3)
