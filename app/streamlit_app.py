@@ -7,11 +7,26 @@ SIH 2026 | Kamrup Metropolitan District, Assam
 Run with:
     streamlit run app/streamlit_app.py
 
-Architecture note
-─────────────────
-All risk scores are currently SYNTHETIC (see generate_dummy_risk).
-When the trained model ships, replace ONLY that function with a call to
-app/predict.py — nothing else in this file needs to change.
+What is real and what is simulated
+─────────────────────────────────
+REAL       Risk scores, for any date from 2018-01-01 to 2025-12-31.
+             risk[cell, date] = trigger_prob[weather_point(cell), date]
+                                * susceptibility_multiplier[cell]
+           Trigger probabilities come from the RandomForest model via the
+           precomputed cache (build_trigger_cache.py, 55,518 rows); the
+           susceptibility layer is terrain-derived and floored by ASDMA's
+           officially identified vulnerable locations
+           (build_susceptibility.py). The cache builder asserts this
+           matches app/predict.py to 1e-6 on all 904 cells.
+SIMULATED  IoT sensor telemetry (app/mqtt_sim.py). No public
+           village-level sensor network exists; the panel demonstrates
+           the ingestion interface a real feed would drop into. This is
+           disclosed in the UI and must stay disclosed.
+
+Regenerating after a model or multiplier change
+───────────────────────────────────────────────
+    python build_susceptibility.py     # susceptibility classes
+    python build_trigger_cache.py      # trigger probability cache
 
 Files owned by this module:
     app/streamlit_app.py  ← this file
@@ -21,9 +36,12 @@ Do NOT import or modify:
     app/grid_utils.py, app/weather_fetch.py, app/terrain_utils.py
 """
 
+import json
 import time
 import os
 import sys
+
+from datetime import date
 
 import numpy as np
 import pandas as pd
@@ -61,71 +79,164 @@ RISK_BINS   = [0.0,  0.25,  0.50,  0.75, 1.01]
 RISK_COLORS = ["#C8F7C5", "#FFF176", "#FF8C00", "#C62828"]
 RISK_LABELS = ["Low", "Medium", "High", "Severe"]
 
-# Hotspot centroids — used only by generate_dummy_risk()
-_HOTSPOTS = [
-    (26.40, 91.52),
-    (26.38, 91.70),
-    (26.35, 91.85),
-    (26.42, 91.60),
+# Opens on the deadliest documented event in the record.
+DEFAULT_DATE = date(2025, 5, 30)
+
+# One-click jumps. Each is a documented event or a reference condition —
+# see data/raw/verified_incidents.csv.
+DEMO_DATES = [
+    ("30 May 2025 — Bonda landslide (5 deaths)", date(2025, 5, 30)),
+    ("17 Jun 2023 — Dhirenpara landslide (1 death)", date(2023, 6, 17)),
+    ("26 May 2020 — wettest hour on record", date(2020, 5, 26)),
+    ("15 Jan 2020 — dry season (contrast)", date(2020, 1, 15)),
 ]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# RISK GENERATION  — TEMPORARY, clearly isolated for easy swap
+# RISK LOADING
 # ══════════════════════════════════════════════════════════════════════════════
 
-def generate_dummy_risk(grid_gdf: gpd.GeoDataFrame) -> np.ndarray:
+# Minimum fraction of grid cells that must resolve to a risk score.
+# A synthetic placeholder grid was once committed whose grid_id scheme
+# ("KM_0001") did not match the rest of the pipeline ("KM_R000_C028"), so the
+# join silently matched 0 of 904 rows and fillna() painted the whole map 0.0
+# risk for days. Fail loudly instead of rendering a lie.
+MIN_RISK_MATCH_FRACTION = 0.50
+
+DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "processed")
+TRIGGER_CACHE = os.path.join(DATA_DIR, "trigger_prob_daily.parquet")
+MAPPING_PARQUET = os.path.join(DATA_DIR, "grid_weather_mapping.parquet")
+SUSCEPTIBILITY_PARQUET = os.path.join(DATA_DIR, "susceptibility_features.parquet")
+MISSING_CELLS_JSON = os.path.join(DATA_DIR, "missing_terrain_cells.json")
+
+# Susceptibility class -> static multiplier.  Imported from app.predict so the
+# app and the offline pipeline can never disagree about the risk scale.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from app.predict import SUSCEPTIBILITY_MULTIPLIERS  # noqa: E402
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STATIC LAYER — grid geometry + per-cell susceptibility.  Loaded once.
+# ══════════════════════════════════════════════════════════════════════════════
+
+@st.cache_data(show_spinner=False)
+def load_static() -> gpd.GeoDataFrame:
     """
-    Generate spatially coherent fake risk probabilities.
+    Grid geometry joined to weather point and susceptibility multiplier.
 
-    # TEMPORARY — replaced by real model predictions in app/predict.py
-    # To swap: return predict.predict_risk(grid_gdf) here.
-
-    Strategy: lat gradient (north = higher risk) + hotspot falloff + noise.
+    Everything here is date-independent, so it is loaded exactly once per
+    session; only the trigger probability changes when the date changes.
     """
-    np.random.seed(7)
-    lats = grid_gdf["centroid_lat"].values
-    lons = grid_gdf["centroid_lon"].values
-
-    lat_min, lat_max = lats.min(), lats.max()
-    lat_range = lat_max - lat_min if lat_max > lat_min else 1e-6
-    lat_score = (lats - lat_min) / lat_range
-
-    hotspot_score = np.zeros(len(grid_gdf))
-    for h_lat, h_lon in _HOTSPOTS:
-        dist = np.sqrt((lats - h_lat) ** 2 + (lons - h_lon) ** 2)
-        sigma = 0.12
-        hotspot_score += np.exp(-(dist ** 2) / (2 * sigma ** 2))
-    hs_max = hotspot_score.max()
-    if hs_max > 0:
-        hotspot_score = 0.5 * hotspot_score / hs_max
-
-    combined = 0.35 * lat_score + 0.50 * hotspot_score
-    noise    = np.random.normal(0, 0.04, size=len(grid_gdf))
-    return np.clip(combined + noise, 0.0, 1.0).astype(np.float32)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# DATA LOADING — cached so the grid + risk scores load ONCE per session
-# ══════════════════════════════════════════════════════════════════════════════
-
-@st.cache_data
-def load_grid() -> gpd.GeoDataFrame:
-    """Load the Kamrup Metro grid and attach dummy risk scores. Cached once."""
     gdf = gpd.read_parquet(GRID_PARQUET)
-    gdf["risk_probability"] = generate_dummy_risk(gdf)
-    gdf["risk_pct"]  = (gdf["risk_probability"] * 100).round(1)
-    gdf["severity"]  = pd.cut(
-        gdf["risk_probability"],
-        bins=RISK_BINS,
-        labels=RISK_LABELS,
-        right=False,
+    mapping = pd.read_parquet(MAPPING_PARQUET, columns=["grid_id", "weather_point_id"])
+    sus = pd.read_parquet(SUSCEPTIBILITY_PARQUET)
+
+    n_before = len(gdf)
+    gdf = gdf.merge(mapping, on="grid_id", how="left")
+    gdf = gdf.merge(sus, on="grid_id", how="left")
+
+    matched = int(gdf["weather_point_id"].notna().sum())
+    if matched / n_before < MIN_RISK_MATCH_FRACTION:
+        msg = "\n".join([
+            f"GRID/WEATHER JOIN FAILED — only {matched} of {n_before} cells "
+            f"({matched/n_before:.1%}) matched a weather point.",
+            "",
+            f"  grid_id in grid file:    {list(gdf['grid_id'].head(2))}",
+            f"  grid_id in mapping file: {list(mapping['grid_id'].head(2))}",
+            "",
+            "The files use different grid_id schemes. Regenerate the grid with "
+            "app.grid_utils.generate_grid() against "
+            "data/raw/boundaries/kamrup_metropolitan.geojson.",
+        ])
+        st.error(msg)
+        raise RuntimeError(msg)
+
+    gdf["susceptibility_mult"] = (
+        gdf["gsi_susceptibility_class"].map(SUSCEPTIBILITY_MULTIPLIERS).fillna(0.0)
     )
+
+    with open(MISSING_CELLS_JSON, "r") as fh:
+        gdf["no_dem"] = gdf["grid_id"].isin(json.load(fh))
+
+    return gdf
+
+
+@st.cache_data(show_spinner=False)
+def load_trigger_cache() -> pd.DataFrame:
+    """
+    Daily-peak trigger probability per (weather_point_id, date).
+
+    55,518 rows covering 2018-2025 — small enough to hold in memory, so any
+    date in range renders as a lookup and a multiply with no model call.
+    Built by build_trigger_cache.py.
+    """
+    df = pd.read_parquet(TRIGGER_CACHE)
+    df["date"] = pd.to_datetime(df["date"])
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def available_date_range() -> tuple:
+    """First and last date present in the trigger cache."""
+    cache = load_trigger_cache()
+    return cache["date"].min().date(), cache["date"].max().date()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RISK FOR A GIVEN DATE
+# ══════════════════════════════════════════════════════════════════════════════
+
+@st.cache_data(show_spinner=False)
+def risk_for_date(target_date) -> pd.DataFrame:
+    """
+    Per-cell risk for one date:  trigger probability x susceptibility.
+
+    Identical to app.predict.predict_risk() on that date's peak hour — the
+    cache builder asserts the two agree to 1e-6 across all 904 cells.
+    Cached per date, so revisiting a date is instant.
+    """
+    static = load_static()
+    cache = load_trigger_cache()
+
+    day = cache[cache["date"] == pd.Timestamp(target_date)]
+    if day.empty:
+        return pd.DataFrame(
+            {"grid_id": static["grid_id"], "trigger_prob": np.nan, "risk": np.nan}
+        )
+
+    trig = static["weather_point_id"].map(
+        day.set_index("weather_point_id")["trigger_prob"]
+    )
+    return pd.DataFrame({
+        "grid_id": static["grid_id"],
+        "trigger_prob": trig.to_numpy(),
+        "risk": (trig * static["susceptibility_mult"]).to_numpy(),
+    })
+
+
+def build_display_gdf(target_date) -> gpd.GeoDataFrame:
+    """Static grid + this date's risk, with severity bands and No-Data cells."""
+    gdf = load_static().copy()
+    gdf["risk_probability"] = risk_for_date(target_date)["risk"].to_numpy()
+    gdf["risk_pct"] = (gdf["risk_probability"] * 100).round(1)
+
+    gdf["severity"] = pd.cut(
+        gdf["risk_probability"], bins=RISK_BINS, labels=RISK_LABELS, right=False
+    )
+    gdf["severity"] = gdf["severity"].cat.add_categories(["No Data"])
+
+    # Cells with no DEM coverage have no susceptibility class, so their risk is
+    # undefined rather than low — render grey, not green.
+    gdf.loc[gdf["no_dem"], "severity"] = "No Data"
+    gdf.loc[gdf["no_dem"], ["risk_probability", "risk_pct"]] = np.nan
+
     return gdf
 
 
 def get_risk_color(risk: float) -> str:
     """Map a risk value [0,1] to its display hex colour."""
+    if pd.isna(risk):
+        return "#808080" # 5th category for No Data
     for i, threshold in enumerate(RISK_BINS[1:]):
         if risk < threshold:
             return RISK_COLORS[i]
@@ -136,7 +247,7 @@ def get_risk_color(risk: float) -> str:
 # MAP BUILDER
 # Not cached with @st.cache_data — folium.Map contains lambdas that
 # can't be pickled by Streamlit's cache. The heavy work (grid I/O + risk
-# scoring) is cached in load_grid(); map build is ~1 s from memory.
+# scoring) is cached in load_static(); map build is ~1 s from memory.
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_folium_map(gdf: gpd.GeoDataFrame, threshold: float) -> folium.Map:
@@ -223,8 +334,10 @@ def build_folium_map(gdf: gpd.GeoDataFrame, threshold: float) -> folium.Map:
       <span style="background:#FFF176;padding:2px 8px;">&nbsp;</span>&nbsp;25&ndash;50% &mdash; Medium<br>
       <span style="background:#FF8C00;padding:2px 8px;">&nbsp;</span>&nbsp;50&ndash;75% &mdash; High<br>
       <span style="background:#C62828;padding:2px 8px;">&nbsp;</span>&nbsp;&gt;75% &mdash; Severe<br>
+      <span style="background:#808080;padding:2px 8px;">&nbsp;</span>&nbsp;No DEM data<br>
       <hr style="border-color:#445;margin:6px 0;">
-      <span style="color:#888;font-size:10px;">&#9888; Risk scores are SIMULATED</span>
+      <span style="color:#888;font-size:10px;">RandomForest trigger &times; susceptibility<br>
+      (terrain + ASDMA official hazard list)</span>
     </div>
     """))
 
@@ -270,8 +383,33 @@ with st.sidebar:
     st.divider()
 
     st.markdown("### 📅 Forecast Date")
-    forecast_date = st.date_input("Select date", label_visibility="collapsed")
-    st.caption("Date selection is ready to wire into the model pipeline.")
+    _min_date, _max_date = available_date_range()
+
+    # A jump button on the previous run leaves a pending date here.  It must
+    # be applied BEFORE the date_input widget is created — Streamlit forbids
+    # writing a widget's session_state key after the widget exists.
+    if "forecast_date" not in st.session_state:
+        st.session_state.forecast_date = DEFAULT_DATE
+    if "_pending_date" in st.session_state:
+        st.session_state.forecast_date = st.session_state.pop("_pending_date")
+
+    forecast_date = st.date_input(
+        "Select date",
+        min_value=_min_date,
+        max_value=_max_date,
+        key="forecast_date",
+        label_visibility="collapsed",
+    )
+    st.caption(
+        f"Any date from {_min_date:%d %b %Y} to {_max_date:%d %b %Y}. "
+        "The map recomputes on change."
+    )
+
+    st.markdown("**Jump to a documented event**")
+    for _label, _d in DEMO_DATES:
+        if st.button(_label, use_container_width=True, key=f"demo_{_d.isoformat()}"):
+            st.session_state["_pending_date"] = _d
+            st.rerun()
 
     st.divider()
 
@@ -297,10 +435,26 @@ with st.sidebar:
     )
 
     st.divider()
+    st.markdown("### 📖 How to read this map")
     st.markdown(
-        '<p class="sidebar-caption">Risk scores are currently <b>synthetic</b>. '
-        "Swap <code>generate_dummy_risk()</code> with <code>predict.predict_risk()</code> "
-        "when the trained model is ready.</p>",
+        '<p class="sidebar-caption">'
+        "<b>Risk = trigger × susceptibility.</b><br><br>"
+        "<b>Trigger</b> is real model output — a RandomForest trained on "
+        "ERA5-Land soil moisture and antecedent precipitation, labelled from "
+        "rainfall intensity–duration thresholds plus 7 verified "
+        "landslide/flood incidents (2022–2025).<br><br>"
+        "<b>Susceptibility is terrain-derived, floored by ASDMA's officially "
+        "identified vulnerable locations.</b> That means a cell can show high "
+        "risk because it appears on Assam's official vulnerable-locations "
+        "list, not only because the terrain model inferred it. We do this "
+        "because 1 km mean slope alone ranks these cells wrongly: every "
+        "documented landslide site in the district sits in a cell that is "
+        "flatter than the district average, since the failure happens on a "
+        "local hill cut a 1 km average erases.<br><br>"
+        "Susceptibility multipliers (0.20 / 0.45 / 0.70 / 0.90) are "
+        "team-assigned weights calibrated to this district's slope "
+        "distribution — not values from a published study."
+        "</p>",
         unsafe_allow_html=True,
     )
 
@@ -320,8 +474,8 @@ with col_date:
 # LOAD DATA
 # ══════════════════════════════════════════════════════════════════════════════
 
-with st.spinner("Loading grid data …"):
-    gdf = load_grid()
+with st.spinner("Loading grid and computing risk …"):
+    gdf = build_display_gdf(forecast_date)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -339,8 +493,14 @@ st_folium(
 )
 
 st.caption(
-    "⚠️ **SIMULATED RISK DATA** — Synthetic risk scores used for demonstration.  "
-    "Colour bands: 🟢 Low (<25%) · 🟡 Medium (25–50%) · 🟠 High (50–75%) · 🔴 Severe (>75%)"
+    "**Risk = RandomForest trigger probability × susceptibility multiplier.** "
+    "Susceptibility is terrain-derived (SRTM slope) and **floored by ASDMA's "
+    "officially identified vulnerable locations** — 34 of 904 cells are raised "
+    "to at least *High* on that basis. Multipliers are team-assigned weights "
+    "calibrated to this district's slope distribution, not values from a "
+    "published study.  "
+    "Bands: 🟢 Low (<25%) · 🟡 Medium (25–50%) · 🟠 High (50–75%) · 🔴 Severe (>75%) · "
+    "⬜ No Data (93 cells outside DEM coverage)."
 )
 
 
@@ -387,7 +547,8 @@ else:
 
     styled = (
         display_df.style
-        .applymap(_sev_color, subset=["Severity"])
+        # Styler.applymap was removed in pandas 3.0 — .map is the replacement
+        .map(_sev_color, subset=["Severity"])
         .format({"Risk %": "{:.1f}"})
         .set_properties(**{"background-color": "rgba(10,20,40,0.6)", "color": "#e0e0e0"})
         .set_table_styles([
