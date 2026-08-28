@@ -36,7 +36,7 @@ Do NOT import or modify:
     app/grid_utils.py, app/weather_fetch.py, app/terrain_utils.py
 """
 
-from explain import explain_cell
+from app.explain import explain_cell
 
 import json
 import time
