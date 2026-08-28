@@ -598,29 +598,6 @@ else:
             f"multiplier = {explanation['final_risk_score']:.1%} final risk."
         )
 
-st.markdown(
-    '<div style="color:#90caf9; font-size:18px; font-weight:700; margin-top:20px;">'
-    '2. Dynamic trigger — what is happening now'
-    '</div>',
-    unsafe_allow_html=True,
-)
-
-trigger_html = explanation["trigger_text"].replace("\n", "<br>")
-
-st.markdown(
-    f'<div style="color:#e0e0e0; font-size:16px; line-height:1.7; margin-top:8px;">'
-    f'{trigger_html}'
-    f'</div>',
-    unsafe_allow_html=True,
-)
-
-st.caption(
-            f"Risk calculation: "
-            f"{explanation['trigger_prob']:.1%} trigger probability × "
-            f"{explanation['susceptibility_multiplier']:.2f} susceptibility "
-            f"multiplier = {explanation['final_risk_score']:.1%} final risk."
-        )
-
 st.caption(
     "**Risk = RandomForest trigger probability × susceptibility multiplier.** "
     "Susceptibility is terrain-derived (SRTM slope) and **floored by ASDMA's "
