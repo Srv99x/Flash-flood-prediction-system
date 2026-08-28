@@ -36,6 +36,8 @@ Do NOT import or modify:
     app/grid_utils.py, app/weather_fetch.py, app/terrain_utils.py
 """
 
+from app.explain import explain_cell
+
 import json
 import time
 import os
@@ -491,6 +493,86 @@ st_folium(
     height=520,
     returned_objects=[],
 )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# WHY IS THIS CELL AT RISK? — EXPLAINABILITY PANEL
+# ══════════════════════════════════════════════════════════════════════════════
+
+st.markdown("### 🔎 Why is this cell at risk?")
+
+# The current Folium map intentionally does not return click events
+# (returned_objects=[]), so use the task-approved Grid ID selector fallback.
+valid_gdf = gdf[gdf["severity"] != "No Data"].copy()
+
+if valid_gdf.empty:
+    st.info("No valid terrain cells are available for explanation on this date.")
+else:
+    # Automatically select the highest-risk valid cell.
+    highest_risk_grid = (
+        valid_gdf.sort_values("risk_probability", ascending=False)
+        .iloc[0]["grid_id"]
+    )
+
+    grid_options = gdf["grid_id"].tolist()
+
+    selected_grid = st.selectbox(
+        "Explain a grid cell",
+        options=grid_options,
+        index=(
+            grid_options.index(highest_risk_grid)
+            if highest_risk_grid in grid_options
+            else 0
+        ),
+        help=(
+            "Select any grid cell to see why its current risk is "
+            "Low, Medium, High, or Severe."
+        ),
+    )
+
+    explanation = explain_cell(
+        selected_grid,
+        forecast_date.strftime("%Y-%m-%d"),
+    )
+
+    if explanation.get("error_state") == "no_dem":
+        st.warning(explanation["summary"])
+    else:
+        st.info(f"**{explanation['summary']}**")
+
+        metric1, metric2, metric3, metric4 = st.columns(4)
+
+        metric1.metric(
+            "Final Risk",
+            f"{explanation['final_risk_score']:.1%}",
+        )
+
+        metric2.metric(
+            "Trigger Probability",
+            f"{explanation['trigger_prob']:.1%}",
+        )
+
+        metric3.metric(
+            "Susceptibility",
+            explanation["susceptibility_class"],
+        )
+
+        metric4.metric(
+            "Severity",
+            explanation["severity"],
+        )
+
+        st.markdown("**1. Static susceptibility — why this place is vulnerable**")
+        st.write(explanation["susceptibility_text"])
+
+        st.markdown("**2. Dynamic trigger — what is happening now**")
+        st.write(explanation["trigger_text"])
+
+        st.caption(
+            f"Risk calculation: "
+            f"{explanation['trigger_prob']:.1%} trigger probability × "
+            f"{explanation['susceptibility_multiplier']:.2f} susceptibility "
+            f"multiplier = {explanation['final_risk_score']:.1%} final risk."
+        )
 
 st.caption(
     "**Risk = RandomForest trigger probability × susceptibility multiplier.** "
