@@ -36,6 +36,10 @@ Do NOT import or modify:
     app/grid_utils.py, app/weather_fetch.py, app/terrain_utils.py
 """
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from app.explain import explain_cell
 
 import json

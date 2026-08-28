@@ -92,6 +92,8 @@ python build_trigger_cache.py      # -> data/processed/trigger_prob_daily.parque
 
 ## Running the app
 
+Run from the repository root:
+
 ```bash
 streamlit run app/streamlit_app.py
 ```
