@@ -60,7 +60,7 @@ from mqtt_sim import get_sensor_readings  # noqa: E402
 # PAGE CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 st.set_page_config(
-    page_title="FloodSense — Kamrup Metro Early Warning",
+    page_title="PRAVAH — Kamrup Metro Early Warning",
     page_icon="🌊",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -282,7 +282,7 @@ def build_folium_map(gdf: gpd.GeoDataFrame, threshold: float) -> folium.Map:
     for _, row in gdf.iterrows():
         risk          = float(row["risk_probability"])
         fill_color    = get_risk_color(risk)
-        fill_opacity  = 0.0 if risk < 0.25 else 0.50
+        fill_opacity  = 0.50
         border_color  = "#FF4444" if risk >= threshold else "#555555"
         border_weight = 2.0 if risk >= threshold else 0.3
 
@@ -379,7 +379,7 @@ h3 { color: #81d4fa !important; }
 # ══════════════════════════════════════════════════════════════════════════════
 
 with st.sidebar:
-    st.markdown("## 🌊 FloodSense")
+    st.markdown("## 🌊 PRAVAH")
     st.markdown("**Kamrup Metro District Early Warning**")
     st.markdown("*SIH 2026 — Flash Flood Prediction System*")
     st.divider()
@@ -561,11 +561,35 @@ else:
             explanation["severity"],
         )
 
-        st.markdown("**1. Static susceptibility — why this place is vulnerable**")
-        st.write(explanation["susceptibility_text"])
+        st.markdown(
+            '<div style="color:#90caf9; font-size:18px; font-weight:700; margin-top:18px;">'
+            '1. Static susceptibility — why this place is vulnerable'
+            '</div>',
+            unsafe_allow_html=True,
+        )
 
-        st.markdown("**2. Dynamic trigger — what is happening now**")
-        st.write(explanation["trigger_text"])
+        st.markdown(
+            f'<div style="color:#e0e0e0; font-size:16px; line-height:1.7; margin-top:8px;">'
+            f'{explanation["susceptibility_text"]}'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+        st.markdown(
+            '<div style="color:#90caf9; font-size:18px; font-weight:700; margin-top:20px;">'
+            '2. Dynamic trigger — what is happening now'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        trigger_html = explanation["trigger_text"].replace("\n", "<br>")
+
+        st.markdown(
+            f'<div style="color:#e0e0e0; font-size:16px; line-height:1.7; margin-top:8px;">'
+            f'{trigger_html}'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
 
         st.caption(
             f"Risk calculation: "
