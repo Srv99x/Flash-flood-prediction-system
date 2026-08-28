@@ -101,7 +101,7 @@ def main() -> None:
     mapping = pd.read_parquet(DATA / "grid_weather_mapping.parquet",
                               columns=["grid_id", "weather_point_id"])
     sus = pd.read_parquet(DATA / "susceptibility_features.parquet")
-    from app.predict import SUSCEPTIBILITY_MULTIPLIERS
+    from app.config import SUSCEPTIBILITY_MULTIPLIERS
 
     cached = mapping.merge(
         daily[daily.date == pd.Timestamp(probe_date)], on="weather_point_id", how="left"

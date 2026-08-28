@@ -2,6 +2,8 @@ import pickle
 from pathlib import Path
 import pandas as pd
 
+from app.config import SUSCEPTIBILITY_MULTIPLIERS
+
 # RandomForest is the shipped model: it won on PR-AUC (0.8257 vs XGBoost's
 # 0.7504) on the episode-grouped split. See docs/model_training_log.md for the
 # split method, seed, and full metrics; rerun app/train_trigger_model.py to
@@ -25,29 +27,8 @@ def load_model():
             _model = pickle.load(f)
     return _model
 
-# ── Susceptibility class -> static risk multiplier ────────────────────
-# TEAM-ASSIGNED weights. NOT derived from a cited study.
-#
-# The multiplier gates how much of the dynamic trigger probability reaches
-# the final score, so it sets the risk scale on high-rainfall dates, where
-# trigger probability saturates near 1.0 and final_risk ~= multiplier.
-#
-# Previous values were 0.1 / 0.3 / 0.7 / 1.0. They were raised because,
-# combined with the old slope cutoffs, 73% of the district was multiplied
-# by 0.1 and the map could not display a High or Severe cell on any date in
-# the record: the single most extreme rainfall hour in eight years produced
-# 770 Low / 133 Medium / 1 High / 0 Severe.
-#
-# Chosen so that on an extreme-rainfall date each susceptibility class lands
-# in its own severity band (Low <0.25, Medium 0.25-0.50, High 0.50-0.75,
-# Severe >=0.75), while a moderate monsoon date (trigger probability <= 0.09)
-# still keeps every cell in Low.
-SUSCEPTIBILITY_MULTIPLIERS = {
-    "Low": 0.20,
-    "Moderate": 0.45,
-    "High": 0.70,
-    "Very High": 0.90,
-}
+# SUSCEPTIBILITY_MULTIPLIERS (susceptibility class -> static risk multiplier)
+# is defined in app/config.py as the single source of truth and imported above.
 
 
 def get_susceptibility_multiplier(grid_ids: pd.Series) -> pd.Series:
@@ -55,7 +36,7 @@ def get_susceptibility_multiplier(grid_ids: pd.Series) -> pd.Series:
     Look up susceptibility class from pre-computed parquet and map it to a
     static risk multiplier.
 
-    See SUSCEPTIBILITY_MULTIPLIERS above: the values are team-assigned and
+    See SUSCEPTIBILITY_MULTIPLIERS in app/config.py: the values are team-assigned and
     tunable, not empirical constants.  Cells with no DEM coverage get 0.0
     and are rendered as "No Data" (grey) by the Streamlit app rather than
     as genuine low risk.
