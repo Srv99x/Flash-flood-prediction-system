@@ -529,10 +529,16 @@ else:
         ),
     )
 
-    explanation = explain_cell(
-        selected_grid,
-        forecast_date.strftime("%Y-%m-%d"),
-    )
+    try:
+        explanation = explain_cell(
+            selected_grid,
+            forecast_date.strftime("%Y-%m-%d"),
+        )
+    except Exception as exc:
+        st.error(
+            f"Explanation failed for {selected_grid} on {forecast_date:%Y-%m-%d}: {exc}"
+        )
+        st.stop()
 
     if explanation.get("error_state") == "no_dem":
         st.warning(explanation["summary"])
