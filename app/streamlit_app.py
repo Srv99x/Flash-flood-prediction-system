@@ -272,13 +272,12 @@ def build_folium_map(gdf: gpd.GeoDataFrame, threshold: float) -> folium.Map:
     )
 
     folium.TileLayer(
-        tiles="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
+        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}",
         attr=(
-            '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a>'
-            ' &copy; <a href="https://carto.com/">CARTO</a>'
+            'Tiles &copy; Esri &mdash; Esri, HERE, Garmin, FAO, NOAA, USGS'
         ),
-        name="Dark Mode",
-        max_zoom=19,
+        name="Esri Dark Gray",
+        max_zoom=16,
     ).add_to(m)
 
     # Build a FeatureCollection with style props embedded in each feature
