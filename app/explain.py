@@ -21,6 +21,7 @@ import geopandas as gpd
 import pandas as pd
 import streamlit as st
 
+from app.config import SUSCEPTIBILITY_MULTIPLIERS
 from app.susceptibility_utils import cells_containing_points
 
 
@@ -34,15 +35,8 @@ MODEL_PATH = Path("models/random_forest_trigger_model.pkl")
 
 
 # ---------------------------------------------------------------------------
-# Production susceptibility multipliers from app/predict.py
+# Production susceptibility multipliers live in app/config.py (imported above).
 # ---------------------------------------------------------------------------
-
-SUSCEPTIBILITY_MULTIPLIERS = {
-    "Low": 0.20,
-    "Moderate": 0.45,
-    "High": 0.70,
-    "Very High": 0.90,
-}
 
 
 # ---------------------------------------------------------------------------
