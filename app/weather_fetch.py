@@ -31,6 +31,103 @@ ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 HOURLY_VARS = "precipitation,soil_moisture_0_to_7cm,soil_moisture_7_to_28cm,temperature_2m"
 TIMEZONE = "Asia/Kolkata"
 
+# Every hourly field the model / feature pipeline consumes downstream.
+# "time" is the index; the other four are the raw inputs to
+# app/features.py -> RandomForest in build_trigger_cache.py.
+REQUIRED_HOURLY_KEYS = (
+    "time",
+    "precipitation",
+    "soil_moisture_0_to_7cm",
+    "soil_moisture_7_to_28cm",
+    "temperature_2m",
+)
+
+
+class WeatherDataError(RuntimeError):
+    """
+    Raised when an Open-Meteo archive response is missing a required hourly
+    field or contains null values in one.
+
+    WHY THIS EXISTS
+    ---------------
+    fetch_weather_point() builds a DataFrame directly from the response.
+    If Open-Meteo returns HTTP 200 but omits a requested variable, or
+    returns a value array with None entries (which happens at the archive
+    edge and for occasional soil-moisture gaps), the resulting column is
+    silently NaN. That NaN then flows unchecked through
+    app/features.build_feature_table() into RandomForest.predict_proba()
+    in build_trigger_cache.py and yields a confident-looking but
+    meaningless trigger probability — and, from there, a wrong risk score
+    on the demo map.
+
+    Silent NaN propagation into the RandomForest predictions was flagged
+    as a demo risk, so we validate the payload and fail loudly here.
+    Do NOT catch this except at a UI boundary (show it via st.error()).
+    """
+
+
+def _validate_hourly_payload(data, weather_point_id, lat, lon, start_date, end_date):
+    """
+    Check that an Open-Meteo archive response carries every required hourly
+    field, fully populated: no missing keys, no None entries, and every
+    value array the same length as the ``time`` axis.
+
+    Raises
+    ------
+    WeatherDataError
+        If any required field is missing or contains null values. The
+        message names the exact field(s) and the weather point / coords /
+        date range being fetched, so a bad fetch can be traced immediately
+        rather than surfacing as a NaN column much later in the pipeline.
+    """
+    where = (
+        f"weather point {weather_point_id} ({lat:.4f}, {lon:.4f}), "
+        f"{start_date}..{end_date}"
+    )
+
+    hourly = data.get("hourly") if isinstance(data, dict) else None
+    if not isinstance(hourly, dict):
+        raise WeatherDataError(
+            f"Open-Meteo response for {where} has no 'hourly' block "
+            f"(top-level keys: {sorted(data) if isinstance(data, dict) else type(data)})."
+        )
+
+    missing_keys = [k for k in REQUIRED_HOURLY_KEYS if k not in hourly]
+    if missing_keys:
+        raise WeatherDataError(
+            f"Open-Meteo response for {where} is missing required hourly "
+            f"field(s): {', '.join(missing_keys)}."
+        )
+
+    time_axis = hourly["time"]
+    n_time = len(time_axis) if time_axis is not None else 0
+    if n_time == 0:
+        raise WeatherDataError(
+            f"Open-Meteo response for {where} has an empty 'time' axis."
+        )
+
+    problems = []
+    for key in REQUIRED_HOURLY_KEYS:
+        values = hourly[key]
+        if values is None:
+            problems.append(f"{key} (entire array is null)")
+            continue
+        if len(values) != n_time:
+            problems.append(
+                f"{key} (length {len(values)} != {n_time} timestamps)"
+            )
+            continue
+        n_null = sum(1 for v in values if v is None)
+        if n_null:
+            problems.append(f"{key} ({n_null}/{n_time} values null)")
+
+    if problems:
+        raise WeatherDataError(
+            f"Open-Meteo response for {where} has missing/null values in: "
+            + "; ".join(problems)
+            + ". Refusing to return NaN weather into the feature pipeline."
+        )
+
 
 def generate_weather_points(boundary_gdf, spacing_km=9, metric_crs="EPSG:32646"):
     """
@@ -147,6 +244,17 @@ def fetch_weather_point(
         raise RuntimeError(
             f"Failed to fetch weather point {weather_point_id} after {max_retries} attempts"
         ) from last_exc
+
+    # Validate the response BEFORE parsing / caching it. A 200 response can
+    # still be missing a variable or carry null entries; parsed naively those
+    # become silent NaN columns that poison the RandomForest trigger
+    # predictions downstream (see WeatherDataError docstring). Raise loudly
+    # instead, naming the field(s) and the point/date. This does not touch
+    # retry, caching, or the API call itself — only what happens after the
+    # payload is in hand — and a failed response is never written to cache.
+    _validate_hourly_payload(
+        data, weather_point_id, lat, lon, start_date, end_date
+    )
 
     hourly = data["hourly"]
     df = pd.DataFrame(
@@ -343,6 +451,12 @@ def _fetch_single_pixel_deprecated(lat: float, lon: float,
     if not hourly or "time" not in hourly:
         raise ValueError(f"Unexpected API response for ({lat}, {lon}): {list(hourly.keys())}")
 
+    # NOTE: this DEPRECATED path still uses hourly.get(api_var), which turns a
+    # missing variable into a silent NaN column. It is intentionally left as-is
+    # because nothing imports or calls it (see the module banner above). The
+    # ACTIVE fetcher, fetch_weather_point(), runs _validate_hourly_payload()
+    # and raises WeatherDataError instead. If this path is ever revived, route
+    # it through that validator too.
     df = pd.DataFrame({"time": pd.to_datetime(hourly["time"])})
     for api_var, col_name in VARIABLE_MAP_DEPRECATED.items():
         df[col_name] = hourly.get(api_var)  # None -> NaN if missing variable

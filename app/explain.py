@@ -311,6 +311,9 @@ def get_peak_hour_features(
         for feature in MODEL_FEATURES
     }
 
+    # Internal input, not a user date: peak_row["timestamp"] comes from the
+    # weather_hourly.parquet timestamp column, already datetime64. No
+    # free-text path reaches this call, so no validation is needed here.
     peak_timestamp = pd.Timestamp(
         peak_row["timestamp"]
     )
@@ -495,7 +498,33 @@ def explain_cell(
     dict
         Structured explanation suitable for Streamlit or notebook use.
     """
-    date_value = pd.Timestamp(date).normalize()
+    # ------------------------------------------------------------------
+    # `date` input path.
+    #
+    # The ONLY production caller is app/streamlit_app.py, which passes
+    # forecast_date.strftime("%Y-%m-%d") where forecast_date comes straight
+    # from st.date_input(...). st.date_input can only ever return a real
+    # datetime.date, so that path can never deliver free text here.
+    #
+    # HOWEVER, explain_cell()'s public signature takes `date: str` and the
+    # docstring invites "notebook use", so a notebook / test / future
+    # text-based date field CAN pass an arbitrary string. An unparseable
+    # value would otherwise surface as a raw pandas parser error deep in the
+    # call stack. Convert it to a clear ValueError here; the Streamlit UI
+    # already catches Exception at the explain_cell() call site and shows it
+    # via st.error(), so this stays a visible message, not a blank crash.
+    # The try/except is cheap insurance that also covers any future caller.
+    # ------------------------------------------------------------------
+    try:
+        date_value = pd.Timestamp(date)
+        if pd.isna(date_value):  # pd.Timestamp(None) / "" return NaT, not an error
+            raise ValueError("parsed to NaT")
+        date_value = date_value.normalize()
+    except (ValueError, TypeError) as exc:
+        raise ValueError(
+            f"explain_cell() received an unparseable date {date!r}: {exc}. "
+            f"Expected an ISO date string like '2025-05-30'."
+        ) from exc
 
     (
         missing_cells,
