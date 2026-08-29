@@ -121,7 +121,7 @@ requirements.txt
 
 **Convention:** explore in `notebooks/*.ipynb`, then extract working logic into `app/*.py` as importable functions. Never let the Streamlit app import from a notebook.
 
-**Git:** fork-and-PR workflow. Main repo is `Srv99x/Flash-flood-prediction-system`. Always clear notebook outputs before committing.
+**Git:** fork-and-PR workflow. Main repo is `Srv99x/PRAVAH`. Always clear notebook outputs before committing.
 
 ## 8. Current state as of 25 Aug 2026
 
