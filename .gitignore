@@ -1,8 +1,16 @@
 venv/
-data/raw/
-data/processed/
+data/raw/*
+data/processed/*
 # Allow the synthetic demo grid (generated, not raw field data)
 !data/processed/kamrup_metro_grid_1km.parquet
+!data/processed/weather_hourly.parquet
+!data/processed/grid_weather_mapping.parquet
+!data/processed/susceptibility_features.parquet
+!data/processed/terrain_features.parquet
+!data/processed/trigger_prob_daily.parquet
+!data/processed/missing_terrain_cells.json
+!data/raw/asdma_vulnerable_locations.csv
+!data/raw/verified_incidents.csv
 __pycache__/
 .ipynb_checkpoints/
 *.tif
