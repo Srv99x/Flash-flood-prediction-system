@@ -1,18 +1,10 @@
-pandas
-numpy
-geopandas
-shapely
-rasterio
-scikit-learn
-xgboost
-shap
-streamlit
-folium
-streamlit-folium   # embeds Folium maps inside Streamlit (Step 3)
-paho-mqtt          # MQTT publish/subscribe structure — broker mocked in demo (Step 5)
-pyarrow            # parquet I/O for the grid file
-matplotlib
-jupyter
-requests
-rasterstats
-pysheds
+pandas==3.0.5
+numpy==2.5.2
+geopandas==1.1.4
+shapely==2.1.2
+scikit-learn==1.9.0
+streamlit==1.62.0
+folium==0.20.0
+streamlit-folium==0.27.4
+paho-mqtt==2.1.0
+pyarrow==25.0.1
