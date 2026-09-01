@@ -147,9 +147,10 @@ Folium · matplotlib · paho-mqtt (simulated feed)
 
 Team Luit — Smart India Hackathon 2026.
 
-*Sourav Chakraborty (Team lead)*
-*Akash Kalita*
-*Khomdram Sanahal*
-*Debjani Singha*
-*Shruti Laitonjam*
-*Samin Fiza Mutlib*
+- Sourav Chakraborty (Team lead)
+- Akash Kalita
+- Khomdram Sanahal
+- Debjani Singha
+- Shruti Laitonjam
+- Samin Fiza Mutlib
+
